@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
-
+from logging import getLogger
 import numpy.typing as npt
 import torch
 from jaxtyping import Float, Int
 from torch import Tensor
+from cs336_basics.bpe import train_bpe
+
+logger = getLogger(__name__)
 
 
 def run_linear(
@@ -591,4 +594,38 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    with open(input_path, "rb") as f:
+        input_data = f.read()
+
+    if not isinstance(input_data, bytes):
+        raise TypeError(
+            f"Expected input data to be of type bytes, got {type(input_data)}"
+        )
+
+    if not input_data:
+        raise ValueError("Input data is empty. Please provide a non-empty input file.")
+
+    if not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError(
+            f"Expected vocab_size to be a positive integer, got {vocab_size}"
+        )
+
+    if not isinstance(special_tokens, list) or not all(
+        isinstance(token, str) for token in special_tokens
+    ):
+        raise ValueError(
+            f"Expected special_tokens to be a list of strings, got {special_tokens}"
+        )
+
+    if len(special_tokens) > vocab_size:
+        raise ValueError(
+            f"Number of special tokens ({len(special_tokens)}) exceeds vocab_size ({vocab_size})."
+        )
+
+    return train_bpe(
+        input_path=input_path,
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+        **kwargs,
+    )
