@@ -32,7 +32,7 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    return in_features @ weights.T
 
 
 def run_embedding(
@@ -53,8 +53,7 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    return weights[token_ids].view(*token_ids.shape, d_model)
 
 
 def run_swiglu(
@@ -86,7 +85,13 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    x1 = torch.matmul(in_features, w1_weight.T)  # (..., d_ff)
+    silu_x1 = x1 * torch.sigmoid(x1)  # SiLU(x1) manually
+    x3 = torch.matmul(in_features, w3_weight.T)  # (..., d_ff)
+    gated = silu_x1 * x3  # (..., d_ff)
+    output = torch.matmul(gated, w2_weight.T)  # (..., d_model)
+
+    return output
 
 
 def run_scaled_dot_product_attention(
@@ -107,7 +112,18 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    # softmax(Q @ K.transpose(-2, -1) / (K.shape[-1] ** 0.5)) @ V
+    q_kT = Q @ K.transpose(-2, -1)  # (..., queries, keys)
+
+    q_kT /= K.shape[-1] ** 0.5  # Scaling by sqrt(d_k)
+
+    # (q_kT/dK**0.5)and adding a −∞ in any entry of the mask matrix that is False.
+    if mask is not None:
+        q_kT = q_kT.masked_fill(mask == 0, float("-inf"))
+
+    attention_weights = torch.softmax(q_kT, dim=-1)  # (..., queries, keys)
+    output = attention_weights @ V  # (..., queries, d_v)
+    return output
 
 
 def run_multihead_self_attention(
@@ -181,7 +197,68 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+
+    out_d_k = d_model // num_heads
+
+    if in_features.shape[-1] != d_model:
+        raise ValueError(
+            f"Input features must have last dimension {d_model}, but got {in_features.shape[-1]}"
+        )
+    if q_proj_weight.shape != (out_d_k, d_model):
+        raise ValueError(
+            f"Q projection weights must have shape ({out_d_k}, {d_model}), but got {q_proj_weight.shape}"
+        )
+    if k_proj_weight.shape != (out_d_k, d_model):
+        raise ValueError(
+            f"K projection weights must have shape ({out_d_k}, {d_model}), but got {k_proj_weight.shape}"
+        )
+    if v_proj_weight.shape != (d_model, d_model):
+        raise ValueError(
+            f"V projection weights must have shape ({d_model}, {d_model}), but got {v_proj_weight.shape}"
+        )
+
+    if o_proj_weight.shape != (d_model, d_model):
+        raise ValueError(
+            f"Output projection weights must have shape ({d_model}, {d_model}), but got {o_proj_weight.shape}"
+        )
+    if (
+        token_positions is not None
+        and token_positions.shape[-1] != in_features.shape[-2]
+    ):
+        raise ValueError(
+            f"Token positions must have last dimension {in_features.shape[-2]}, but got {token_positions.shape[-1]}"
+        )
+
+    # Reshape the weights to match the number of heads
+    q_proj_weight = q_proj_weight.view(num_heads, out_d_k, d_model)
+    k_proj_weight = k_proj_weight.view(num_heads, out_d_k, d_model)
+    v_proj_weight = v_proj_weight.view(num_heads, d_model, d_model)
+    o_proj_weight = o_proj_weight.view(d_model, d_model)
+
+    # Project the input features to get Q, K, V
+    Q = in_features @ q_proj_weight.transpose(-2, -1)  # (..., sequence_length, d_k)
+    K = in_features @ k_proj_weight.transpose(-2, -1)  # (..., sequence_length, d_k)
+    V = in_features @ v_proj_weight.transpose(-2, -1)  # (..., sequence_length, d_v)
+
+    # Reshape Q, K, V to have the shape (..., num_heads, sequence_length, d_k)
+    Q = Q.view(*Q.shape[:-1], num_heads, out_d_k).transpose(
+        -2, -3
+    )  # (..., num_heads, sequence_length, d_k)
+    K = K.view(*K.shape[:-1], num_heads, out_d_k).transpose(
+        -2, -3
+    )  # (..., num_heads, sequence_length, d_k)
+    V = V.view(*V.shape[:-1], num_heads, d_model).transpose(
+        -2, -3
+    )  # (..., num_heads, sequence_length, d_v)
+
+    # Apply RoPE to Q and K
+    if token_positions is not None:
+        if token_positions.shape[-1] > max_seq_len:
+            raise ValueError(
+                f"Token positions length {token_positions.shape[-1]} exceeds max_seq_len {max_seq_len}"
+            )
+        Q = run_rope(out_d_k, theta, max_seq_len, Q, token_positions)
+        K = run_rope(out_d_k, theta, max_seq_len, K, token_positions)
 
 
 def run_rope(
@@ -203,7 +280,46 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+
+    if in_query_or_key.shape[-1] != d_k:
+        raise ValueError(
+            f"Input tensor must have last dimension {d_k}, but got {in_query_or_key.shape[-1]}"
+        )
+    if token_positions.shape[-1] != in_query_or_key.shape[-2]:
+        raise ValueError(
+            f"Token positions must have last dimension {in_query_or_key.shape[-2]}, but got {token_positions.shape[-1]}"
+        )
+
+    # Compute RoPE angles for each position in the batch and sequence
+    # token_positions: (..., sequence_length)
+    # We want to create angles of shape (..., sequence_length, d_k // 2)
+    half_dim = d_k // 2
+    # Compute the frequency exponents
+    freq_seq = torch.arange(half_dim, device=in_query_or_key.device)
+    inv_freq = 1.0 / (theta ** (freq_seq.float() / half_dim))
+    # Expand token_positions to (..., sequence_length, 1)
+    pos = token_positions.unsqueeze(-1).float()
+    angles = pos * inv_freq  # (..., sequence_length, half_dim)
+
+    # Now, get cos and sin
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+
+    # Split the last dimension of in_query_or_key into pairs
+    # (..., sequence_length, d_k) -> (..., sequence_length, half_dim, 2)
+    x = in_query_or_key
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+
+    # Apply rotation
+    x_rotated_0 = x1 * cos - x2 * sin
+    x_rotated_1 = x1 * sin + x2 * cos
+
+    # Interleave the rotated pairs back together
+    x_rotated = torch.stack((x_rotated_0, x_rotated_1), dim=-1)
+    x_rotated = x_rotated.flatten(-2)
+
+    return x_rotated
 
 
 def run_transformer_block(
@@ -381,7 +497,25 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+
+    if in_features.shape[-1] != d_model:
+        raise ValueError(
+            f"Input features must have last dimension {d_model}, but got {in_features.shape[-1]}"
+        )
+    if weights.shape != (d_model,):
+        raise ValueError(
+            f"Weights must have shape ({d_model},), but got {weights.shape}"
+        )
+
+    # Compute RMSNorm
+    mean_square = torch.mean(in_features**2, dim=-1, keepdim=True)
+    rms = torch.sqrt(mean_square + eps)
+    normalized_features = in_features / rms
+
+    # Apply the affine transformation
+    output = normalized_features * weights
+
+    return output
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -395,7 +529,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return in_features * torch.sigmoid(in_features)
 
 
 def run_get_batch(
