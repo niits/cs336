@@ -434,7 +434,12 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+
+    max_value = in_features.amax(dim=dim, keepdim=True)
+    exp_values = torch.exp(in_features - max_value)
+    sum_exp_values = exp_values.sum(dim=dim, keepdim=True)
+    softmax_output = exp_values / sum_exp_values
+    return softmax_output.clamp(min=1e-7, max=1 - 1e-7)
 
 
 def run_cross_entropy(
@@ -452,7 +457,19 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    max_logits = torch.max(inputs, dim=1, keepdim=True).values
+
+    log_sum_exp = max_logits + torch.log(
+        torch.sum(torch.exp(inputs - max_logits), dim=1, keepdim=True)
+    )
+
+    # Gather the log probabilities corresponding to the true classes
+    log_probs = inputs - log_sum_exp
+    true_class_log_probs = log_probs[torch.arange(targets.size(0)), targets]
+
+    # Compute the mean cross-entropy loss
+    loss = -torch.mean(true_class_log_probs)
+    return loss
 
 
 def run_gradient_clipping(
@@ -466,7 +483,22 @@ def run_gradient_clipping(
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    total_norm = torch.norm(
+        torch.stack(
+            [
+                torch.norm(parameter.grad, 2)
+                for parameter in parameters
+                if parameter.requires_grad
+            ]
+        ),
+        2,
+    )
+
+    if total_norm > max_l2_norm:
+        scaling_factor = max_l2_norm / total_norm
+        for parameter in parameters:
+            if parameter.requires_grad and parameter.grad is not None:
+                parameter.grad.data.mul_(scaling_factor)
 
 
 def get_adamw_cls() -> type[torch.optim.Optimizer]:
